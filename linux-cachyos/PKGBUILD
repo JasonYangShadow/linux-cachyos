@@ -119,7 +119,12 @@
 # Builds the open nvidia module and package it into a own base
 # This does replace the requirement of nvidia-open-dkms
 # Use this only if you have Turing+ GPU
-: "${_build_nvidia_open:=no}"
+: "${_build_nvidia_open:=yes}"
+
+# Skip building the full kernel and only build+package the nvidia open module.
+# Requires linux-cachyos-headers to already be installed.
+# Use this when iterating on nvidia patches without waiting for a full kernel rebuild.
+: "${_only_nvidia_open:=no}"
 
 # Builds the r8125 module and package it into its own package
 # Replaces requirement for r8125-dkms
@@ -190,39 +195,47 @@ url="https://github.com/CachyOS/linux-cachyos"
 license=('GPL-2.0-only')
 options=('!strip' '!debug' '!lto')
 makedepends=(
-  bc
-  binutils
-  cpio
-  gettext
-  glibc
-  libelf
-  libgcc
-  openssl
-  pahole
-  perl
-  python
-  rust
-  rust-bindgen
-  rust-src
   tar
-  xxhash
   xz
-  zlib
-  zstd
 )
+if [ "$_only_nvidia_open" != "yes" ]; then
+    makedepends+=(
+      bc
+      binutils
+      cpio
+      gettext
+      glibc
+      libelf
+      libgcc
+      openssl
+      pahole
+      perl
+      python
+      rust
+      rust-bindgen
+      rust-src
+      xxhash
+      zlib
+      zstd
+    )
+fi
 
 _patchsource="https://raw.githubusercontent.com/cachyos/kernel-patches/master/${_major}"
 _nv_ver=595.71.05
 _nv_pkg="NVIDIA-Linux-x86_64-${_nv_ver}"
 _nv_open_pkg="NVIDIA-kernel-module-source-${_nv_ver}"
-source=(
-    "https://github.com/CachyOS/linux/releases/download/${_srcname}/${_srcname}.tar.gz"
-    "config")
+if [ "$_only_nvidia_open" != "yes" ]; then
+    source=(
+        "https://github.com/CachyOS/linux/releases/download/${_srcname}/${_srcname}.tar.gz"
+        "config")
+else
+    source=()
+fi
 
 # LLVM makedepends
 if _is_lto_kernel; then
     makedepends+=(clang llvm lld)
-    source+=("${_patchsource}/misc/dkms-clang.patch")
+    [ "$_only_nvidia_open" != "yes" ] && source+=("${_patchsource}/misc/dkms-clang.patch")
     BUILD_FLAGS=(
         CC=clang
         LD=ld.lld
@@ -248,7 +261,8 @@ if [ "$_build_nvidia_open" = "yes" ]; then
              "${_patchsource}/misc/nvidia/0002-Add-IBT-support.patch"
              "${_patchsource}/misc/nvidia/0003-fix-dsc-correct-RC-parameter-tables-to-match-VESA-DS.patch"
              "${_patchsource}/misc/nvidia/0004-fix-dsc-use-bits_per_component-for-flatnessDetThresh.patch"
-             "${_patchsource}/misc/nvidia/0005-fix-dp-add-Bigscreen-Beyond-VR-headset-to-WAR-databa.patch")
+             "${_patchsource}/misc/nvidia/0005-fix-dp-add-Bigscreen-Beyond-VR-headset-to-WAR-databa.patch"
+             "https://raw.githubusercontent.com/JasonYangShadow/kernel-patches/7.0-nvidia-0006-fix-gsp-assertion-failure/7.0/misc/nvidia/0006-fix-gsp-assertion-failure.patch")
 fi
 
 # Use generated AutoFDO Profile
@@ -289,6 +303,22 @@ export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EP
 _die() { error "$@" ; exit 1; }
 
 prepare() {
+    # When only building nvidia, skip all kernel steps and only apply nvidia patches
+    if [ "$_only_nvidia_open" = "yes" ]; then
+        local src
+        for patch in "${source[@]}"; do
+            patch="${patch%%::*}"
+            src="${patch##*/}"
+            src="${src%.zst}"
+            [[ $src = *.patch ]] || continue
+            if [[ "$patch" == */misc/nvidia/* ]]; then
+                echo "Applying nvidia patch $src..."
+                patch -Np1 < "${srcdir}/$src" -d "${srcdir}/${_nv_open_pkg}"
+            fi
+        done
+        return
+    fi
+
     cd "$_srcname"
 
     echo "Setting version..."
@@ -302,7 +332,7 @@ prepare() {
         src="${src%.zst}"
         [[ $src = *.patch ]] || continue
         echo "Applying patch $src..."
-        if [[ "$patch" == "${_patchsource}"/misc/nvidia/* ]]; then
+        if [[ "$patch" == */misc/nvidia/* ]]; then
             patch -Np1 < "../$src" -d "${srcdir}/${_nv_open_pkg}"
         else
             patch -Np1 < "../$src"
@@ -522,13 +552,19 @@ prepare() {
 
 _sign_modules() {
     msg2 "Signing modules in $1"
-    local sign_script="${srcdir}/${_srcname}/scripts/sign-file"
-    local sign_key="$(grep -Po 'CONFIG_MODULE_SIG_KEY="\K[^"]*' "${srcdir}/${_srcname}/.config")"
-    if [[ ! "$sign_key" =~ ^/ ]]; then
-        sign_key="${srcdir}/${_srcname}/${sign_key}"
+    local _kbuild
+    if [ "$_only_nvidia_open" = "yes" ]; then
+        _kbuild="/usr/lib/modules/${pkgver}-${pkgrel}-${_pkgsuffix}/build"
+    else
+        _kbuild="${srcdir}/${_srcname}"
     fi
-    local sign_cert="${srcdir}/${_srcname}/certs/signing_key.x509"
-    local hash_algo="$(grep -Po 'CONFIG_MODULE_SIG_HASH="\K[^"]*' "${srcdir}/${_srcname}/.config")"
+    local sign_script="${_kbuild}/scripts/sign-file"
+    local sign_key="$(grep -Po 'CONFIG_MODULE_SIG_KEY="\K[^"]*' "${_kbuild}/.config")"
+    if [[ ! "$sign_key" =~ ^/ ]]; then
+        sign_key="${_kbuild}/${sign_key}"
+    fi
+    local sign_cert="${_kbuild}/certs/signing_key.x509"
+    local hash_algo="$(grep -Po 'CONFIG_MODULE_SIG_HASH="\K[^"]*' "${_kbuild}/.config")"
 
     if [ "$_use_llvm_lto" != "none" ]; then
         local strip_bin="llvm-strip"
@@ -542,6 +578,22 @@ _sign_modules() {
 }
 
 build() {
+    if [ "$_only_nvidia_open" = "yes" ]; then
+        local _kver="${pkgver}-${pkgrel}-${_pkgsuffix}"
+        local _headers="/usr/lib/modules/${_kver}/build"
+        [[ -d "$_headers" ]] || { error "Kernel headers not found at $_headers. Install linux-cachyos-headers first."; exit 1; }
+        local MODULE_FLAGS=(
+            KERNEL_UNAME="${_kernuname}"
+            IGNORE_PREEMPT_RT_PRESENCE=1
+            IGNORE_CC_MISMATCH=yes
+            SYSSRC="$_headers"
+            SYSOUT="$_headers"
+        )
+        cd "${srcdir}/${_nv_open_pkg}"
+        CFLAGS= CXXFLAGS= LDFLAGS= make "${BUILD_FLAGS[@]}" "${MODULE_FLAGS[@]}" -j"$(nproc)" modules
+        return
+    fi
+
     cd "$_srcname"
     make "${BUILD_FLAGS[@]}" -j"$(nproc)" all
 
@@ -772,8 +824,12 @@ _package-nvidia-open(){
     conflicts=("$pkgbase-nvidia")
     license=('MIT AND GPL-2.0-only')
 
-    cd "$_srcname"
-    local modulesdir="$pkgdir/usr/lib/modules/$(<version)/extramodules"
+    if [ "$_only_nvidia_open" = "yes" ]; then
+        local modulesdir="$pkgdir/usr/lib/modules/${pkgver}-${pkgrel}-${_pkgsuffix}/extramodules"
+    else
+        cd "$_srcname"
+        local modulesdir="$pkgdir/usr/lib/modules/$(<version)/extramodules"
+    fi
 
     cd "${srcdir}/${_nv_open_pkg}"
     install -dm755 "${modulesdir}"
@@ -804,12 +860,15 @@ _package-r8125() {
     echo "install r8169 /usr/bin/modprobe r8125 || /usr/bin/modprobe --ignore-install r8169" > "${pkgdir}/usr/lib/modprobe.d/${pkgname}.conf"
 }
 
-pkgname=("$pkgbase")
-[ "$_build_debug" = "yes" ] && pkgname+=("$pkgbase-dbg")
-pkgname+=("$pkgbase-headers")
-[ "$_build_zfs" = "yes" ] && pkgname+=("$pkgbase-zfs")
+pkgname=()
+if [ "$_only_nvidia_open" != "yes" ]; then
+    pkgname+=("$pkgbase")
+    [ "$_build_debug" = "yes" ] && pkgname+=("$pkgbase-dbg")
+    pkgname+=("$pkgbase-headers")
+    [ "$_build_zfs" = "yes" ] && pkgname+=("$pkgbase-zfs")
+fi
 [ "$_build_nvidia_open" = "yes" ] && pkgname+=("$pkgbase-nvidia-open")
-[ "$_build_r8125" = "yes" ] && pkgname+=("$pkgbase-r8125")
+[ "$_build_r8125" = "yes" ] && [ "$_only_nvidia_open" != "yes" ] && pkgname+=("$pkgbase-r8125")
 for _p in "${pkgname[@]}"; do
     eval "package_$_p() {
     $(declare -f "_package${_p#$pkgbase}")
@@ -817,6 +876,21 @@ for _p in "${pkgname[@]}"; do
     }"
 done
 
+if [ "$_only_nvidia_open" != "yes" ]; then
 b2sums=('058e3f3b3d69d937318757cc128e76fba22690e8dd7ff4d8ec34e625c430d214669e94857b5e45f74d0e16ec2f4278fde58b917443e3a795426f195d564ead3a'
         '7bb5113dbc67e8e2ce5c5473ae1b08973af5adba0a6a14c64a213bb116e5a172d40b7c274b85ad15553511484ee1f120e0372251e242c6f87ce6920235f0c136'
-        'c992567bd7dd8553432be496ffa1c17e2f5ebe9c7edb51945cf977e1b742dd6517c210d8843bb82744ca705efd07f8027cd7dde41b50215ebd707a34aa81462e')
+        'c992567bd7dd8553432be496ffa1c17e2f5ebe9c7edb51945cf977e1b742dd6517c210d8843bb82744ca705efd07f8027cd7dde41b50215ebd707a34aa81462e'
+        'SKIP' # NVIDIA-kernel-module-source tarball
+        'SKIP' # 0002-Add-IBT-support.patch
+        'SKIP' # 0003-fix-dsc-correct-RC-parameter-tables-to-match-VESA-DS.patch
+        'SKIP' # 0004-fix-dsc-use-bits_per_component-for-flatnessDetThresh.patch
+        'SKIP' # 0005-fix-dp-add-Bigscreen-Beyond-VR-headset-to-WAR-databa.patch
+        'SKIP') # 0006-fix-gsp-assertion-failure.patch
+else
+b2sums=('SKIP' # NVIDIA-kernel-module-source tarball
+        'SKIP' # 0002-Add-IBT-support.patch
+        'SKIP' # 0003-fix-dsc-correct-RC-parameter-tables-to-match-VESA-DS.patch
+        'SKIP' # 0004-fix-dsc-use-bits_per_component-for-flatnessDetThresh.patch
+        'SKIP' # 0005-fix-dp-add-Bigscreen-Beyond-VR-headset-to-WAR-databa.patch
+        'SKIP') # 0006-fix-gsp-assertion-failure.patch
+fi
