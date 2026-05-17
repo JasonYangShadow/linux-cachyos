@@ -1,4 +1,5 @@
 ### ArchLinuxPackages ###
+*.patch
 *.tar
 *.tar.*
 *.jar
